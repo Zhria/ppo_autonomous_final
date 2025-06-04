@@ -30,7 +30,7 @@ class PPO(tf.keras.Model):
         self.entropyCoeffiecient=0.020
         self.learningRate=3e-4
         self.trainIterations=5 # pi and v update iterations for backprop
-        self.target_kl=0.02 # target kl divergence
+        self.target_kl=0.03 # target kl divergence
         """
         END HYPER PARAMETERS
         """
@@ -74,9 +74,7 @@ class PPO(tf.keras.Model):
     def logp(self, logits, actions):
         """
             Returns:
-            
-            logp based on the action drawn from prob-distribution \n
-            indexes in the logp_all with one_hot
+            logp based on the action drawn from prob-distribution indexes in the logp_all with one_hot
         """
         logp_all = tf.nn.log_softmax(logits)
         one_hot = tf.one_hot(actions, depth= self.nActions)
@@ -103,17 +101,14 @@ class PPO(tf.keras.Model):
         batch_actions = []
         batch_values = []
         batch_logp = []
-        batch_ep_rews = []
-        batch_ep_lens = []
         frames=[]
         if self.lastDoneEnv == True:
             obs=self.env.reset()
         else:
             obs=self.lastObs
-        len_last_ep=0
         i=0
         last_done=False
-        for step in range(self.nSteps):
+        for _ in range(self.nSteps):
             action,logp_t,value,_=self.getActionAndLogProb(obs)
             obs,rew,done,_=self.env.step(action)
             batch_obs.append(obs)
@@ -125,26 +120,22 @@ class PPO(tf.keras.Model):
             batch_dones.append(done)
             self.lastDoneEnv=done
             self.lastObs=obs
-            last_done=done
             if done:
-                batch_ep_rews.append(batch_rews)
-                batch_ep_lens.append(step-len_last_ep)
-                len_last_ep=step
                 obs=self.env.reset()
                 self.recorder.saveRecord(frames,i,False)
                 frames=[]
                 i+=1
-        
+
         _,_,last_values,_=self.getActionAndLogProb(self.lastObs)
         print("Reward rollout: ",np.sum(batch_rews))
-
+        last_done=batch_dones[-1] #Last done value
         #Calc advantages and returns
         returns = np.zeros_like(batch_rews)
         advs = np.zeros_like(batch_rews)
         last_gae_lam = 0
         for t in reversed(range(self.nSteps)):
             if t == self.nSteps - 1:
-                next_non_terminal = 1.0 - last_done
+                next_non_terminal = 1.0 - last_done #True=1.0, False=0.0
                 next_values = last_values
             else:
                 next_non_terminal = 1.0 - batch_dones[t + 1]
@@ -153,13 +144,13 @@ class PPO(tf.keras.Model):
             delta = batch_rews[t] + self.gamma * next_values * next_non_terminal - batch_values[t]
             advs[t] = last_gae_lam = delta + self.gamma * self.lam * next_non_terminal * last_gae_lam
             
-        returns = advs + batch_values                         # ADV = RETURNS - VALUES
-        advs = (advs - advs.mean()) / (advs.std())      # Normalize ADVs
+        returns = advs + batch_values                   
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)      #Normalization
 
         if np.sum(batch_rews)==0:
-            print("No rewards in this epoch") #This should never happen. If it happens i need another rollout because with this rollout the model cannot learn
-        #    self.rollout()
-        return tf.convert_to_tensor(batch_obs, dtype=tf.uint8) ,tf.convert_to_tensor(batch_actions) ,tf.reshape(tf.convert_to_tensor(batch_logp,dtype=tf.float32),[-1]), tf.convert_to_tensor(returns), tf.convert_to_tensor(advs)
+            print("No rewards in this epoch")
+        
+        return tf.convert_to_tensor(batch_obs) ,tf.convert_to_tensor(batch_actions) ,tf.reshape(tf.convert_to_tensor(batch_logp,dtype=tf.float32),[-1]), tf.convert_to_tensor(returns), tf.convert_to_tensor(advs)
     
 
     def losses(self, obs, logp_old, actions, advs, returns):
@@ -173,25 +164,18 @@ class PPO(tf.keras.Model):
         clipped_loss = tf.minimum(ratio * advs, clipped_ratio * advs)
 
         policy_loss=-tf.reduce_mean(clipped_loss)
-        value_loss=tf.reduce_mean(tf.square(returns - values)) * 0.5 * self.valueCoefficient
+        value_loss=tf.reduce_mean(tf.square(returns - values)) * self.valueCoefficient
         total_loss=policy_loss+value_loss+entropy_loss
-        #print("Total loss: ",total_loss.numpy()," Policy loss: ",policy_loss.numpy()," Value loss: ",value_loss.numpy()," Entropy loss: ",entropy_loss.numpy())
         return total_loss, approx_kl
     
 
     def train(self, obs, actions, advs, returns, logp):
-        """
-            Update Policy and the Value Network
-            -----------------------------------
-                Inputs: obs, act, advantages, returns, logp-t
-                Returns: loss-pi, loss-entropy, approx-ent, kl, loss-v, loss-total
-        """
         inds = np.arange(self.nSteps)
 
         for i in range(self.trainIterations):
             total_loss, approx_kl = self.update_loop( obs, actions, advs, returns, logp,inds) 
 
-            if approx_kl > 1.5 * self.target_kl:
+            if approx_kl > self.target_kl:
                 print("Early stopping at step %d due to reaching max kl." %i)
                 break
 
@@ -200,10 +184,6 @@ class PPO(tf.keras.Model):
 
 
     def update_loop(self, obs, actions, advs, returns, logp_t, inds):
-        """
-            Make updates with random sampled minibatches and 
-            return mean kl-div for early breaking
-        """
         np.random.shuffle(inds)
         means = []
 
